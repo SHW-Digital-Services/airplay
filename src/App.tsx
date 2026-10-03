@@ -13,6 +13,7 @@ export default function App() {
   const [currentMode, setCurrentMode] = useState<'receiver' | 'sender' | 'presentation'>('receiver');
   const [roomId, setRoomId] = useState<string>('AIR-7492');
   const [pin, setPin] = useState<string>('4829');
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   
   const [roomState, setRoomState] = useState<AirPlayReceiverState>({
     status: 'waiting',
@@ -50,6 +51,7 @@ export default function App() {
   ]);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
 
   // Check URL query parameters for mode
   useEffect(() => {
@@ -85,7 +87,7 @@ export default function App() {
       }
     };
 
-    ws.onmessage = (evt) => {
+    ws.onmessage = async (evt) => {
       try {
         const msg = JSON.parse(evt.data);
         if (msg.type === 'ROOM_REGISTERED') {
@@ -100,6 +102,45 @@ export default function App() {
           setRoomState(msg.payload);
         } else if (msg.type === 'PROTOCOL_LOG_ADDED') {
           setProtocolLogs((prev) => [...prev, msg.payload]);
+        } else if (msg.type === 'signal') {
+          // WebRTC Signaling on Receiver side
+          const { type, sdp, candidate } = msg.payload || {};
+          if (type === 'offer') {
+            const pc = new RTCPeerConnection({
+              iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+            });
+            pcRef.current = pc;
+
+            pc.ontrack = (event) => {
+              if (event.streams && event.streams[0]) {
+                setRemoteStream(event.streams[0]);
+              }
+            };
+
+            pc.onicecandidate = (event) => {
+              if (event.candidate && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                wsRef.current.send(JSON.stringify({
+                  type: 'signal',
+                  roomId,
+                  payload: { candidate: event.candidate },
+                }));
+              }
+            };
+
+            await pc.setRemoteDescription(new RTCSessionDescription({ type, sdp }));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+
+            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+              wsRef.current.send(JSON.stringify({
+                type: 'signal',
+                roomId,
+                payload: { type: answer.type, sdp: answer.sdp },
+              }));
+            }
+          } else if (candidate && pcRef.current) {
+            await pcRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+          }
         } else if (msg.type === 'SENDER_DISCONNECTED') {
           setRoomState((prev) => ({
             ...prev,
@@ -107,6 +148,11 @@ export default function App() {
             protocolStage: 'Awaiting Device Connection',
             handshakeProgress: 0,
           }));
+          setRemoteStream(null);
+          if (pcRef.current) {
+            pcRef.current.close();
+            pcRef.current = null;
+          }
           setProtocolLogs((prev) => [
             ...prev,
             {
@@ -115,7 +161,7 @@ export default function App() {
               layer: 'RTSP Control',
               direction: 'IN',
               summary: 'TEARDOWN rtsp://pc-receiver.local/stream RTSP/1.0',
-              details: 'Session closed gracefully by Apple device.',
+              details: 'Session closed gracefully by Apple device. Returned to receiver standby.',
             },
           ]);
         }
@@ -131,11 +177,11 @@ export default function App() {
     };
   }, [roomId, pin, currentMode]);
 
-  // Quick Test Handshake simulation
+  // Instant Connect Apple Device & Auto-Display Screen
   const handleSimulateHandshake = () => {
     const srp = generateSrpHandshakePayloads(pin);
 
-    // Sequence of simulated handshake events
+    // Step 1: Handshake initiation
     const log1: ProtocolLog = {
       id: `log-${Date.now()}-1`,
       timestamp: new Date().toLocaleTimeString(),
@@ -163,6 +209,7 @@ export default function App() {
       handshakeProgress: 40,
     }));
 
+    // Step 2: Curve25519
     setTimeout(() => {
       const log3: ProtocolLog = {
         id: `log-${Date.now()}-3`,
@@ -174,8 +221,9 @@ export default function App() {
       };
       setProtocolLogs((prev) => [...prev, log3]);
       setRoomState((prev) => ({ ...prev, handshakeProgress: 75 }));
-    }, 700);
+    }, 400);
 
+    // Step 3: RTSP ANNOUNCE & RECORD -> AUTOMATICALLY DISPLAYS RECEIVING SCREEN!
     setTimeout(() => {
       const log4: ProtocolLog = {
         id: `log-${Date.now()}-4`,
@@ -194,6 +242,8 @@ export default function App() {
         details: 'UDP Ports: Video RTP 7000, Audio RTP 7001, NTP Clock Sync 7002.',
       };
       setProtocolLogs((prev) => [...prev, log4, log5]);
+
+      // Automatically transitions and displays receiving screen!
       setRoomState((prev) => ({
         ...prev,
         status: 'streaming',
@@ -202,7 +252,33 @@ export default function App() {
         resolution: '1920x1080',
         fps: 60,
       }));
-    }, 1400);
+    }, 800);
+  };
+
+  const handleDisconnect = () => {
+    setRoomState((prev) => ({
+      ...prev,
+      status: 'waiting',
+      protocolStage: 'Awaiting Device Connection',
+      handshakeProgress: 0,
+    }));
+    setRemoteStream(null);
+    if (pcRef.current) {
+      pcRef.current.close();
+      pcRef.current = null;
+    }
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'UPDATE_ROOM_STATE',
+        roomId,
+        payload: {
+          status: 'waiting',
+          protocolStage: 'Awaiting Device Connection',
+          handshakeProgress: 0,
+        },
+      }));
+    }
   };
 
   const handleToggleMiracastBridge = (active: boolean) => {
@@ -251,9 +327,11 @@ export default function App() {
         pin={pin}
         roomState={roomState}
         protocolLogs={protocolLogs}
+        remoteStream={remoteStream}
         onOpenMobileSender={() => setCurrentMode('sender')}
         onSimulateAppleHandshake={handleSimulateHandshake}
         onToggleMiracastBridge={handleToggleMiracastBridge}
+        onDisconnect={handleDisconnect}
         onClearLogs={() => setProtocolLogs([])}
       />
     </div>

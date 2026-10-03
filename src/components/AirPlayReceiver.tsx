@@ -1,579 +1,601 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
-  Tv, 
-  QrCode, 
   Cast, 
-  Radio, 
-  ShieldCheck, 
-  Maximize, 
-  Minimize, 
-  Volume2, 
-  VolumeX, 
-  RefreshCw, 
-  Terminal, 
-  ExternalLink, 
+  Smartphone, 
   CheckCircle2, 
   AlertCircle, 
-  Sliders, 
-  Smartphone,
-  Copy,
-  Check,
-  Play,
-  RotateCw
+  Lock, 
+  ArrowRight, 
+  Monitor, 
+  RefreshCw,
+  Video,
+  Camera,
+  Layers,
+  Sparkles,
+  ExternalLink,
+  ChevronLeft,
+  Play
 } from 'lucide-react';
-import { generateQrCodeDataUrl } from '../utils/qr';
-import { ProtocolInspector } from './ProtocolInspector';
-import { WindowsWirelessBridge } from './WindowsWirelessBridge';
-import { AirPlayReceiverState, ProtocolLog } from '../types/airplay';
+import { VirtualiOSDevice } from './VirtualiOSDevice';
+import { generateSrpHandshakePayloads, generateRtspAnnouncePlist } from '../services/airplayProtocol';
 
-interface AirPlayReceiverProps {
+interface AppleDeviceSenderProps {
   roomId: string;
-  pin: string;
-  roomState: AirPlayReceiverState;
-  protocolLogs: ProtocolLog[];
-  onOpenMobileSender: () => void;
-  onSimulateAppleHandshake: () => void;
-  onToggleMiracastBridge: (active: boolean) => void;
-  onClearLogs?: () => void;
+  defaultPin: string;
+  onBackToReceiver?: () => void;
+  isStandaloneTab?: boolean;
 }
 
-export const AirPlayReceiver: React.FC<AirPlayReceiverProps> = ({
+export const AppleDeviceSender: React.FC<AppleDeviceSenderProps> = ({
   roomId,
-  pin,
-  roomState,
-  protocolLogs,
-  onOpenMobileSender,
-  onSimulateAppleHandshake,
-  onToggleMiracastBridge,
-  onClearLogs,
+  defaultPin,
+  onBackToReceiver,
+  isStandaloneTab = false,
 }) => {
-  const [qrDataUrl, setQrDataUrl] = useState<string>('');
-  const [isInspectorOpen, setIsInspectorOpen] = useState(false);
-  const [volume, setVolume] = useState(85);
-  const [isMuted, setIsMuted] = useState(false);
-  const [isFullscreen, setIsFullscreen] = useState(false);
-  const [aspectRatio, setAspectRatio] = useState<'portrait' | 'landscape' | 'ipad' | 'fill'>('portrait');
-  const [copiedLink, setCopiedLink] = useState(false);
+  const [pinInput, setPinInput] = useState(defaultPin);
+  const [deviceModel, setDeviceModel] = useState('Apple iPhone 16 Pro (iOS 18.2)');
+  const [handshakeState, setHandshakeState] = useState<'idle' | 'authenticating' | 'handshaking' | 'streaming' | 'error'>('idle');
+  const [currentStepIndex, setCurrentStepIndex] = useState(0);
+  const [errorMessage, setErrorMessage] = useState('');
+  const [sourceType, setSourceType] = useState<'virtual' | 'screen' | 'camera'>('virtual');
+  const [autoStartCountdown, setAutoStartCountdown] = useState<number | null>(2);
   
-  const containerRef = useRef<HTMLDivElement>(null);
-  const videoCanvasRef = useRef<HTMLCanvasElement>(null);
-  const animFrameRef = useRef<number | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const virtualCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Generate QR code encoding the mobile sender pairing URL
-  useEffect(() => {
-    const senderUrl = `${window.location.origin}/?mode=sender&room=${roomId}&pin=${pin}`;
-    generateQrCodeDataUrl(senderUrl).then((url) => {
-      setQrDataUrl(url);
-    });
-  }, [roomId, pin]);
+  const handshakeSteps = [
+    { title: 'Bonjour Discovery', desc: 'Discovered _airplay._tcp.local on 224.0.0.251' },
+    { title: 'SRP-6a Pair-Setup', desc: 'Exchanging ephemeral keys A & B with PIN verification' },
+    { title: 'Curve25519 Pair-Verify', desc: 'Deriving ChaCha20-Poly1305 symmetric session key' },
+    { title: 'RTSP Stream Setup', desc: 'ANNOUNCE & SETUP binary plist parameters negotiated' },
+    { title: 'AirPlay 2 RTP Stream', desc: 'H.264 Video & ALAC Audio streaming active' },
+  ];
 
-  // Fullscreen change listener
+  // Initialize WebSocket connection to signaling server
   useEffect(() => {
-    const handleFullscreenChange = () => {
-      setIsFullscreen(!!document.fullscreenElement);
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}`;
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      // Register as sender
+      ws.send(JSON.stringify({
+        type: 'REGISTER_SENDER',
+        roomId,
+        payload: {
+          clientModel: deviceModel,
+          pin: pinInput,
+        },
+      }));
     };
-    document.addEventListener('fullscreenchange', handleFullscreenChange);
-    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
-  }, []);
 
-  const toggleFullscreen = () => {
-    if (!containerRef.current) return;
-    if (!document.fullscreenElement) {
-      containerRef.current.requestFullscreen().catch((err) => console.warn(err));
-    } else {
-      document.exitFullscreen().catch((err) => console.warn(err));
+    ws.onmessage = async (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        if (msg.type === 'SENDER_REGISTERED') {
+          // Ready to connect
+        } else if (msg.type === 'AUTH_FAILED') {
+          setHandshakeState('error');
+          setErrorMessage(msg.payload?.message || 'Authentication failed. Please verify AirPlay code.');
+        } else if (msg.type === 'signal') {
+          const { type, candidate, sdp } = msg.payload || {};
+          if (type === 'answer' && pcRef.current) {
+            await pcRef.current.setRemoteDescription(new RTCSessionDescription({ type, sdp }));
+          } else if (candidate && pcRef.current) {
+            await pcRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+          }
+        }
+      } catch (err) {
+        console.error('Sender WS message parse error:', err);
+      }
+    };
+
+    return () => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
+    };
+  }, [roomId, deviceModel]);
+
+  // Auto-connect timer if valid PIN is present
+  useEffect(() => {
+    if (autoStartCountdown === null) return;
+    if (autoStartCountdown > 0) {
+      const timer = setTimeout(() => {
+        setAutoStartCountdown(autoStartCountdown - 1);
+      }, 1000);
+      return () => clearTimeout(timer);
+    } else if (autoStartCountdown === 0 && handshakeState === 'idle') {
+      startAirPlayHandshake();
+      setAutoStartCountdown(null);
+    }
+  }, [autoStartCountdown, handshakeState]);
+
+  // Execute full protocol handshake
+  const startAirPlayHandshake = async () => {
+    if (!pinInput || pinInput.length !== 4) {
+      setErrorMessage('Please enter the 4-digit AirPlay code shown on the PC screen.');
+      return;
+    }
+
+    setAutoStartCountdown(null);
+    setHandshakeState('authenticating');
+    setErrorMessage('');
+    setCurrentStepIndex(0);
+
+    const srp = generateSrpHandshakePayloads(pinInput);
+
+    // Notify receiver immediately that handshake has started so receiver enters transition
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'UPDATE_ROOM_STATE',
+        roomId,
+        payload: {
+          status: 'handshaking',
+          clientModel: deviceModel,
+          protocolStage: 'Pair-Setup Initiated',
+          handshakeProgress: 20,
+        },
+      }));
+    }
+
+    // Step 1: Bonjour discovery log
+    sendProtocolLog({
+      layer: 'mDNS/Bonjour',
+      direction: 'IN',
+      summary: `Resolving AirPlay-PC-Receiver [AppleTV3,2]._airplay._tcp.local`,
+      details: `SRV target: pc-receiver.local:7000, TXT: features=0x5A7FFFF7,0x1E model=AppleTV3,2`,
+    });
+
+    // Step 2: SRP-6a Pair-Setup
+    setTimeout(() => {
+      setCurrentStepIndex(1);
+      sendProtocolLog({
+        layer: 'Pair-Setup (SRP)',
+        direction: 'OUT',
+        summary: `POST /pair-setup (Stage 1: SRP Client Ephemeral Key)`,
+        details: `Client Ephemeral A: ${srp.clientA.slice(0, 32)}... PIN: ****`,
+      });
+      sendProtocolLog({
+        layer: 'Pair-Setup (SRP)',
+        direction: 'IN',
+        summary: `HTTP/1.1 200 OK (Stage 2: SRP Server Challenge)`,
+        details: `Salt: ${srp.srpSalt}, Server Ephemeral B: ${srp.serverB.slice(0, 32)}...`,
+      });
+    }, 400);
+
+    // Step 3: Curve25519 Pair-Verify
+    setTimeout(() => {
+      setCurrentStepIndex(2);
+      sendProtocolLog({
+        layer: 'Pair-Setup (SRP)',
+        direction: 'OUT',
+        summary: `POST /pair-setup (Stage 3: SRP Evidence M1 Verification)`,
+        details: `M1 Proof: ${srp.proofM1}, Verified OK! Server confirmation M2: ${srp.proofM2}`,
+      });
+      sendProtocolLog({
+        layer: 'FairPlay/AES',
+        direction: 'OUT',
+        summary: `POST /pair-verify (Curve25519 ECDH Exchange)`,
+        details: `Derived Symmetric Master Key: ${srp.sessionKey}. Cipher: ChaCha20-Poly1305`,
+      });
+    }, 800);
+
+    // Step 4: RTSP ANNOUNCE & SETUP
+    setTimeout(() => {
+      setCurrentStepIndex(3);
+      sendProtocolLog({
+        layer: 'RTSP Control',
+        direction: 'OUT',
+        summary: `ANNOUNCE rtsp://pc-receiver.local/stream RTSP/1.0`,
+        details: generateRtspAnnouncePlist(1920, 1080, 60),
+      });
+      sendProtocolLog({
+        layer: 'RTSP Control',
+        direction: 'OUT',
+        summary: `SETUP rtsp://pc-receiver.local/stream/video RTSP/1.0`,
+        details: `Transport: RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port=7001;timing_port=7002`,
+      });
+    }, 1200);
+
+    // Step 5: RTSP RECORD & Mirroring Stream Active
+    setTimeout(() => {
+      setCurrentStepIndex(4);
+      setHandshakeState('streaming');
+      sendProtocolLog({
+        layer: 'RTSP Control',
+        direction: 'OUT',
+        summary: `RECORD rtsp://pc-receiver.local/stream RTSP/1.0`,
+        details: `Range: npt=0- ; RTP-Info: url=rtsp://pc-receiver.local/stream/video;seq=1;rtptime=0`,
+      });
+      sendProtocolLog({
+        layer: 'RTP/AV',
+        direction: 'OUT',
+        summary: `RTP Streaming Active: H.264 High Profile (Payload Type 96)`,
+        details: `Video: 1920x1080 @ 60fps, Audio: ALAC 44.1kHz 16-bit Stereo (Payload Type 96)`,
+      });
+
+      // Update room state on server so PC receiver automatically displays the receiving screen!
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({
+          type: 'UPDATE_ROOM_STATE',
+          roomId,
+          payload: {
+            status: 'streaming',
+            clientModel: deviceModel,
+            protocolStage: 'Active AirPlay 2 Stream',
+            handshakeProgress: 100,
+            resolution: '1920x1080',
+            fps: 60,
+          },
+        }));
+      }
+
+      // Establish WebRTC stream
+      setupWebRTCStream();
+    }, 1600);
+  };
+
+  const sendProtocolLog = (log: { layer: any; direction: any; summary: string; details?: string }) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'PROTOCOL_LOG',
+        roomId,
+        payload: {
+          id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+          timestamp: new Date().toLocaleTimeString(),
+          ...log,
+        },
+      }));
     }
   };
 
-  const handleCopyLink = () => {
-    const senderUrl = `${window.location.origin}/?mode=sender&room=${roomId}&pin=${pin}`;
-    navigator.clipboard.writeText(senderUrl);
-    setCopiedLink(true);
-    setTimeout(() => setCopiedLink(false), 2000);
-  };
+  const setupWebRTCStream = async () => {
+    try {
+      const pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+      });
+      pcRef.current = pc;
 
-  // Video Canvas Renderer (handles real or simulated incoming AirPlay H.264 stream)
-  useEffect(() => {
-    const canvas = videoCanvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    let frameCount = 0;
-    const render = () => {
-      frameCount++;
-      const w = canvas.width;
-      const h = canvas.height;
-
-      if (roomState.status === 'streaming') {
-        // Active Mirroring Frame Rendering
-        // High-fidelity wallpaper gradient background
-        const grad = ctx.createLinearGradient(0, 0, w, h);
-        grad.addColorStop(0, '#090d16');
-        grad.addColorStop(0.5, '#131b2e');
-        grad.addColorStop(1, '#0b1120');
-        ctx.fillStyle = grad;
-        ctx.fillRect(0, 0, w, h);
-
-        // Fluid dynamic background glow
-        ctx.save();
-        ctx.fillStyle = 'rgba(56, 189, 248, 0.18)';
-        ctx.beginPath();
-        ctx.arc(w * 0.7, h * 0.3 + Math.sin(frameCount * 0.03) * 25, 200, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.fillStyle = 'rgba(168, 85, 247, 0.15)';
-        ctx.beginPath();
-        ctx.arc(w * 0.3, h * 0.7 + Math.cos(frameCount * 0.03) * 25, 220, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.restore();
-
-        // Miracast Transcoding Banner if active
-        if (roomState.windowsDisplayActive) {
-          ctx.save();
-          ctx.fillStyle = 'rgba(30, 58, 138, 0.85)';
-          ctx.strokeStyle = '#38bdf8';
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          ctx.roundRect(w * 0.05, 30, w * 0.9, 44, 10);
-          ctx.fill();
-          ctx.stroke();
-
-          ctx.fillStyle = '#ffffff';
-          ctx.font = 'bold 13px "Plus Jakarta Sans", sans-serif';
-          ctx.textAlign = 'left';
-          ctx.fillText('WINDOWS WIRELESS DISPLAY ACTIVE (Miracast / WFD MPEG-2 TS)', w * 0.08, 56);
-
-          ctx.fillStyle = '#7dd3fc';
-          ctx.font = '12px "JetBrains Mono", monospace';
-          ctx.textAlign = 'right';
-          ctx.fillText('0.4ms Lag · 60 FPS', w * 0.92, 56);
-          ctx.restore();
+      pc.onicecandidate = (event) => {
+        if (event.candidate && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({
+            type: 'signal',
+            roomId,
+            payload: { candidate: event.candidate },
+          }));
         }
+      };
 
-        // Apple Device Mirror Header & Screen Simulation
-        const topOffset = roomState.windowsDisplayActive ? 90 : 40;
-        const screenW = w * 0.86;
-        const screenH = h - topOffset - 60;
-        const screenX = (w - screenW) / 2;
-        const screenY = topOffset;
-
-        // Phone screen card
-        ctx.save();
-        ctx.fillStyle = '#020617';
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.roundRect(screenX, screenY, screenW, screenH, 24);
-        ctx.fill();
-        ctx.stroke();
-
-        // Top Status Bar
-        ctx.fillStyle = '#ffffff';
-        ctx.font = 'bold 14px "Plus Jakarta Sans", sans-serif';
-        ctx.textAlign = 'left';
-        ctx.fillText('9:41', screenX + 32, screenY + 36);
-
-        ctx.textAlign = 'right';
-        ctx.font = '12px "Plus Jakarta Sans", sans-serif';
-        ctx.fillText('5G · AirPlay Active', screenX + screenW - 32, screenY + 36);
-
-        // Dynamic Island
-        ctx.fillStyle = '#000000';
-        ctx.beginPath();
-        ctx.roundRect(screenX + screenW / 2 - 55, screenY + 16, 110, 28, 14);
-        ctx.fill();
-
-        // Main Mirror Content: Active Apple Keynote / App feed
-        ctx.fillStyle = '#0f172a';
-        ctx.beginPath();
-        ctx.roundRect(screenX + 24, screenY + 64, screenW - 48, screenH - 96, 16);
-        ctx.fill();
-
-        ctx.fillStyle = '#38bdf8';
-        ctx.font = 'bold 20px "Plus Jakarta Sans", sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText('Apple AirPlay 2 Receiver Screen', screenX + screenW / 2, screenY + screenH * 0.32);
-
-        ctx.fillStyle = '#94a3b8';
-        ctx.font = '14px "Plus Jakarta Sans", sans-serif';
-        ctx.fillText(`Connected Source: ${roomState.clientModel}`, screenX + screenW / 2, screenY + screenH * 0.38);
-
-        // Audio VU meter simulation on screen
-        const vuWidth = screenW * 0.6;
-        const vuX = screenX + (screenW - vuWidth) / 2;
-        const vuY = screenY + screenH * 0.52;
-
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
-        ctx.beginPath();
-        ctx.roundRect(vuX, vuY, vuWidth, 40, 10);
-        ctx.fill();
-
-        const numVuBars = 20;
-        const barW = vuWidth / numVuBars - 4;
-        for (let b = 0; b < numVuBars; b++) {
-          const barH = isMuted ? 4 : Math.abs(Math.sin(frameCount * 0.15 + b * 0.3)) * 26 + 4;
-          ctx.fillStyle = b > 15 ? '#ef4444' : b > 11 ? '#f59e0b' : '#10b981';
-          ctx.beginPath();
-          ctx.roundRect(vuX + b * (barW + 4) + 4, vuY + 34 - barH, barW, barH, 2);
-          ctx.fill();
+      // Get track from virtual canvas stream or physical screen
+      let stream: MediaStream | null = null;
+      if (sourceType === 'screen') {
+        try {
+          stream = await navigator.mediaDevices.getDisplayMedia({
+            video: { frameRate: { ideal: 60 } },
+            audio: true,
+          });
+        } catch (e) {
+          console.warn('Screen share canceled, using virtual device:', e);
         }
-
-        ctx.fillStyle = '#94a3b8';
-        ctx.font = '12px "JetBrains Mono", monospace';
-        ctx.fillText('ALAC 44.1kHz 16-bit Decoded Audio Stream', screenX + screenW / 2, vuY + 64);
-
-        // Bottom stats
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
-        ctx.font = '12px "JetBrains Mono", monospace';
-        ctx.fillText('H.264 High Profile · 60.0 FPS · NTP Sub-Frame Synchronized', screenX + screenW / 2, screenY + screenH - 24);
-        ctx.restore();
+      } else if (sourceType === 'camera') {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { width: 1280, height: 720 },
+            audio: true,
+          });
+        } catch (e) {
+          console.warn('Camera capture failed:', e);
+        }
       }
 
-      animFrameRef.current = requestAnimationFrame(render);
-    };
+      if (!stream && virtualCanvasRef.current) {
+        stream = virtualCanvasRef.current.captureStream(60);
+      }
 
-    animFrameRef.current = requestAnimationFrame(render);
-    return () => {
-      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
-    };
-  }, [roomState.status, roomState.clientModel, roomState.windowsDisplayActive, isMuted]);
+      if (stream) {
+        localStreamRef.current = stream;
+        stream.getTracks().forEach((track) => pc.addTrack(track, stream!));
+      }
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({
+          type: 'signal',
+          roomId,
+          payload: { type: offer.type, sdp: offer.sdp },
+        }));
+      }
+    } catch (err) {
+      console.error('Failed to setup WebRTC sender:', err);
+    }
+  };
+
+  const handleDisconnect = () => {
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((t) => t.stop());
+    }
+    if (pcRef.current) {
+      pcRef.current.close();
+      pcRef.current = null;
+    }
+    setHandshakeState('idle');
+    setCurrentStepIndex(0);
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'UPDATE_ROOM_STATE',
+        roomId,
+        payload: {
+          status: 'waiting',
+          protocolStage: 'Awaiting Device Connection',
+          handshakeProgress: 0,
+        },
+      }));
+    }
+  };
+
+  const handleCanvasUpdate = (canvas: HTMLCanvasElement) => {
+    virtualCanvasRef.current = canvas;
+  };
 
   return (
-    <div ref={containerRef} className="w-full flex flex-col font-sans">
-      {/* Top Header Bar following Top Bar Contract (3 zones) */}
-      <header className="flex items-center justify-between px-6 py-4 border-b border-neutral-800 bg-neutral-950">
-        {/* Zone 1: Single text element wordmark */}
+    <div className="min-h-screen bg-neutral-950 text-neutral-100 flex flex-col items-center justify-start p-4 sm:p-6 font-sans">
+      {/* Top Header */}
+      <div className="w-full max-w-4xl flex items-center justify-between pb-4 border-b border-neutral-800 mb-6">
         <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-blue-600/20 border border-blue-500/40 flex items-center justify-center">
-            <Tv className="w-4 h-4 text-blue-400" />
-          </div>
+          {onBackToReceiver && (
+            <button
+              onClick={onBackToReceiver}
+              className="p-2 text-neutral-400 hover:text-white hover:bg-neutral-900 rounded-lg transition-colors flex items-center gap-1.5 text-xs"
+            >
+              <ChevronLeft className="w-4 h-4" />
+              <span>Back to Receiver Screen</span>
+            </button>
+          )}
           <div>
-            <span className="text-base font-bold tracking-tight text-white block">
-              AirPlay PC Receiver
+            <h1 className="text-base font-semibold tracking-tight text-white flex items-center gap-2">
+              <Smartphone className="w-4 h-4 text-blue-500" />
+              Apple AirPlay Sender
+            </h1>
+            <p className="text-xs text-neutral-400">
+              Session: <span className="font-mono text-neutral-200">{roomId}</span>
+            </p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-neutral-400 hidden sm:inline">Receiver:</span>
+          <span className="text-xs font-mono text-neutral-300 bg-neutral-900 px-2.5 py-1 rounded border border-neutral-800">
+            AirPlay-PC-Receiver
+          </span>
+        </div>
+      </div>
+
+      <div className="w-full max-w-4xl grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+        {/* Left Column: Device Screen / Source Selector */}
+        <div className="lg:col-span-6 flex flex-col items-center">
+          <div className="w-full mb-3 flex items-center justify-between">
+            <span className="text-xs font-medium text-neutral-400 uppercase tracking-wider">
+              AirPlay Broadcast Source
             </span>
-            <div className="flex items-center gap-2 text-xs text-neutral-400">
-              <span className="font-mono text-neutral-300">AppleTV3,2</span>
-              <span aria-hidden="true">·</span>
-              <span>Windows Wireless Display Bridge</span>
-            </div>
-          </div>
-        </div>
-
-        {/* Zone 2: Navigation / Protocol status info */}
-        <div className="hidden md:flex items-center gap-5 text-xs text-neutral-400">
-          <div className="flex items-center gap-1.5">
-            <span className={`w-2 h-2 rounded-full ${roomState.status === 'streaming' ? 'bg-emerald-400 animate-pulse' : 'bg-blue-400'}`} />
-            <span className="text-neutral-300 font-medium">
-              {roomState.status === 'streaming' ? 'AirPlay Active' : 'mDNS Discovery Ready'}
-            </span>
-          </div>
-          <span aria-hidden="true">·</span>
-          <span>Port 7000 (RTSP)</span>
-          <span aria-hidden="true">·</span>
-          <span>Port 5000 (RAOP)</span>
-          <span aria-hidden="true">·</span>
-          <span>{protocolLogs.length} Protocol Packets</span>
-        </div>
-
-        {/* Zone 3: Primary Action buttons */}
-        <div className="flex items-center gap-2.5">
-          <button
-            onClick={() => setIsInspectorOpen(true)}
-            className="px-3 py-1.5 rounded-lg text-xs font-medium bg-neutral-900 hover:bg-neutral-800 text-neutral-200 border border-neutral-800 flex items-center gap-1.5 transition-colors"
-          >
-            <Terminal className="w-3.5 h-3.5 text-blue-400" />
-            Protocol Inspector
-          </button>
-          <button
-            onClick={onOpenMobileSender}
-            className="px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white shadow-xs transition-colors flex items-center gap-1.5"
-          >
-            <Smartphone className="w-3.5 h-3.5" />
-            Launch Apple Device Client
-          </button>
-        </div>
-      </header>
-
-      {/* Main Receiver Content Viewport */}
-      <main className="p-4 sm:p-6 max-w-7xl w-full mx-auto space-y-6">
-        {roomState.status !== 'streaming' ? (
-          /* INITIALIZATION STATE: Prominent QR Code Handshake Station */
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
-            {/* Left Box: Prominent QR Code and Handshake Instructions */}
-            <div className="lg:col-span-7 bg-neutral-900 border border-neutral-800 rounded-2xl p-6 sm:p-8 flex flex-col justify-between shadow-xl">
-              <div>
-                <div className="flex items-center justify-between mb-3">
-                  <div className="flex items-center gap-2">
-                    <QrCode className="w-5 h-5 text-blue-500" />
-                    <h2 className="text-lg font-bold text-white tracking-tight">
-                      Scan QR Code to Connect AirPlay
-                    </h2>
-                  </div>
-                  <span className="text-xs font-mono px-2.5 py-1 rounded bg-neutral-950 border border-neutral-800 text-neutral-300">
-                    Pairing Session: {roomId}
-                  </span>
-                </div>
-                <p className="text-xs text-neutral-400 leading-relaxed mb-6">
-                  Point your iPhone, iPad, or Mac camera at this QR code. The connection will perform an automatic
-                  cryptographic handshake via Apple&apos;s SRP-6a protocol, exchange Curve25519 session keys, and stream over RTSP/RTP.
-                </p>
-
-                {/* QR Code and PIN challenge display */}
-                <div className="flex flex-col sm:flex-row items-center gap-6 bg-neutral-950 p-6 rounded-2xl border border-neutral-800">
-                  {/* QR Image */}
-                  <div className="bg-white p-3 rounded-2xl shadow-md shrink-0">
-                    {qrDataUrl ? (
-                      <img
-                        src={qrDataUrl}
-                        alt="AirPlay Connection Handshake QR Code"
-                        className="w-48 h-48 block rounded-lg"
-                        referrerPolicy="no-referrer"
-                      />
-                    ) : (
-                      <div className="w-48 h-48 flex items-center justify-center bg-neutral-100 text-neutral-500 text-xs">
-                        Generating QR Code...
-                      </div>
-                    )}
-                  </div>
-
-                  {/* 4-Digit Security Code Card */}
-                  <div className="flex-1 w-full text-center sm:text-left space-y-3">
-                    <div>
-                      <span className="text-[11px] font-mono text-neutral-400 uppercase tracking-wider block">
-                        AirPlay Security Code
-                      </span>
-                      <p className="text-xs text-neutral-400 mt-0.5">
-                        If prompted by iOS or macOS, verify this 4-digit code:
-                      </p>
-                    </div>
-
-                    {/* Classic Apple TV 4-Digit Challenge Display */}
-                    <div className="flex items-center justify-center sm:justify-start gap-2.5 my-2">
-                      {pin.split('').map((digit, i) => (
-                        <div
-                          key={i}
-                          className="w-12 h-14 bg-neutral-900 border-2 border-neutral-700 rounded-xl flex items-center justify-center text-2xl font-bold font-mono text-white shadow-inner"
-                        >
-                          {digit}
-                        </div>
-                      ))}
-                    </div>
-
-                    <div className="pt-2 flex flex-wrap items-center gap-2 justify-center sm:justify-start">
-                      <button
-                        onClick={handleCopyLink}
-                        className="px-3 py-1.5 bg-neutral-900 hover:bg-neutral-800 text-neutral-300 text-xs font-medium rounded-lg border border-neutral-800 flex items-center gap-1.5 transition-colors"
-                      >
-                        {copiedLink ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                        {copiedLink ? 'Copied Link' : 'Copy Direct Link'}
-                      </button>
-
-                      <button
-                        onClick={onSimulateAppleHandshake}
-                        className="px-3.5 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-sky-300 text-xs font-medium rounded-lg border border-neutral-700 flex items-center gap-1.5 transition-colors"
-                      >
-                        <Play className="w-3.5 h-3.5 text-sky-400" />
-                        Quick Test Handshake
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Zeroconf Discovery Profile */}
-              <div className="mt-6 pt-4 border-t border-neutral-800/80 flex flex-wrap items-center justify-between gap-3 text-xs text-neutral-400">
-                <div className="flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                  <span>mDNS Advertisement: <strong className="text-neutral-200">_airplay._tcp.local:7000</strong></span>
-                </div>
-                <div>
-                  <span>Device Name: <strong className="text-neutral-200">AirPlay-PC-Receiver</strong></span>
-                </div>
-              </div>
-            </div>
-
-            {/* Right Box: Protocol Capabilities & Handshake Flow */}
-            <div className="lg:col-span-5 bg-neutral-900 border border-neutral-800 rounded-2xl p-6 sm:p-7 flex flex-col justify-between shadow-xl">
-              <div>
-                <h3 className="text-sm font-semibold text-white mb-1 flex items-center gap-2">
-                  <ShieldCheck className="w-4 h-4 text-emerald-400" />
-                  Apple Device Handshake Protocol Suite
-                </h3>
-                <p className="text-xs text-neutral-400 mb-4">
-                  Compliant with all Apple AirPlay 2 and Miracast specifications.
-                </p>
-
-                <div className="space-y-2.5">
-                  <div className="p-3 bg-neutral-950 rounded-xl border border-neutral-800">
-                    <div className="flex items-center justify-between text-xs font-semibold text-neutral-200 mb-1">
-                      <span>1. Zeroconf Discovery</span>
-                      <span className="text-[11px] font-mono text-blue-400">RFC 6762</span>
-                    </div>
-                    <p className="text-[11px] text-neutral-400">
-                      mDNS / DNS-SD on 224.0.0.251:5353 broadcasting features=0x5A7FFFF7,0x1E and model=AppleTV3,2.
-                    </p>
-                  </div>
-
-                  <div className="p-3 bg-neutral-950 rounded-xl border border-neutral-800">
-                    <div className="flex items-center justify-between text-xs font-semibold text-neutral-200 mb-1">
-                      <span>2. SRP-6a Mutual Pairing</span>
-                      <span className="text-[11px] font-mono text-blue-400">RFC 5054</span>
-                    </div>
-                    <p className="text-[11px] text-neutral-400">
-                      Mutual authentication using 4-digit PIN, ephemeral public keys A and B, and proof calculation M1/M2.
-                    </p>
-                  </div>
-
-                  <div className="p-3 bg-neutral-950 rounded-xl border border-neutral-800">
-                    <div className="flex items-center justify-between text-xs font-semibold text-neutral-200 mb-1">
-                      <span>3. Curve25519 &amp; FairPlay</span>
-                      <span className="text-[11px] font-mono text-blue-400">RFC 7748</span>
-                    </div>
-                    <p className="text-[11px] text-neutral-400">
-                      Shared secret derivation with ChaCha20-Poly1305 symmetric cipher and FairPlay DRM stream decryption.
-                    </p>
-                  </div>
-
-                  <div className="p-3 bg-neutral-950 rounded-xl border border-neutral-800">
-                    <div className="flex items-center justify-between text-xs font-semibold text-neutral-200 mb-1">
-                      <span>4. RTSP 1.0 &amp; RTP/ALAC</span>
-                      <span className="text-[11px] font-mono text-blue-400">RFC 2326</span>
-                    </div>
-                    <p className="text-[11px] text-neutral-400">
-                      Binary plist parameter negotiation, UDP RTP port mapping, and sub-frame NTP clock synchronization.
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              {/* Status indicator */}
-              <div className="mt-5 p-3 rounded-xl bg-blue-950/30 border border-blue-800/40 text-xs text-blue-300 flex items-center justify-between">
-                <span>Waiting for Apple device to scan QR code...</span>
-                <span className="w-2 h-2 rounded-full bg-blue-400 animate-ping" />
-              </div>
-            </div>
-          </div>
-        ) : (
-          /* ACTIVE STREAMING STATE: Video Player Canvas & Controls */
-          <div className="space-y-4">
-            <div className="relative bg-black rounded-2xl overflow-hidden border border-neutral-800 shadow-2xl flex items-center justify-center min-h-[500px]">
-              <canvas
-                ref={videoCanvasRef}
-                width={1920}
-                height={1080}
-                className={`w-full max-h-[72vh] object-contain transition-all duration-300 ${
-                  aspectRatio === 'portrait' ? 'max-w-md' : 'max-w-full'
+            <div className="flex items-center gap-1 bg-neutral-900 p-0.5 rounded-lg border border-neutral-800">
+              <button
+                onClick={() => setSourceType('virtual')}
+                className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors ${
+                  sourceType === 'virtual' ? 'bg-neutral-800 text-white shadow-xs' : 'text-neutral-400 hover:text-neutral-200'
                 }`}
-              />
+              >
+                Virtual iOS
+              </button>
+              <button
+                onClick={() => setSourceType('screen')}
+                className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors ${
+                  sourceType === 'screen' ? 'bg-neutral-800 text-white shadow-xs' : 'text-neutral-400 hover:text-neutral-200'
+                }`}
+              >
+                My Screen
+              </button>
+              <button
+                onClick={() => setSourceType('camera')}
+                className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors ${
+                  sourceType === 'camera' ? 'bg-neutral-800 text-white shadow-xs' : 'text-neutral-400 hover:text-neutral-200'
+                }`}
+              >
+                Camera
+              </button>
+            </div>
+          </div>
 
-              {/* Top Floating Stream Overlay */}
-              <div className="absolute top-4 left-4 right-4 flex items-center justify-between pointer-events-none">
-                <div className="pointer-events-auto flex items-center gap-2 bg-neutral-950/80 backdrop-blur-md px-3 py-1.5 rounded-xl border border-neutral-800 text-xs text-neutral-300">
-                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                  <span>{roomState.clientModel}</span>
-                  <span aria-hidden="true" className="text-neutral-600">·</span>
-                  <span className="font-mono text-sky-400">{roomState.resolution}</span>
-                  <span aria-hidden="true" className="text-neutral-600">·</span>
-                  <span className="font-mono text-neutral-400">{roomState.fps} FPS</span>
+          {sourceType === 'virtual' ? (
+            <VirtualiOSDevice onFrameUpdate={handleCanvasUpdate} />
+          ) : (
+            <div className="w-full aspect-9/16 max-w-xs bg-neutral-900 border border-neutral-800 rounded-3xl p-6 flex flex-col items-center justify-center text-center">
+              {sourceType === 'screen' ? (
+                <>
+                  <Monitor className="w-12 h-12 text-blue-500 mb-3" />
+                  <h3 className="text-sm font-semibold text-white mb-1">Live Device Screen Broadcast</h3>
+                  <p className="text-xs text-neutral-400 mb-4">
+                    Will request browser display capture to stream your physical screen over AirPlay.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <Camera className="w-12 h-12 text-pink-500 mb-3" />
+                  <h3 className="text-sm font-semibold text-white mb-1">Camera Feed Broadcast</h3>
+                  <p className="text-xs text-neutral-400 mb-4">
+                    Streams live camera feed with AirPlay RTP packaging and ALAC audio.
+                  </p>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Right Column: Handshake, PIN & Status */}
+        <div className="lg:col-span-6 flex flex-col gap-4">
+          {/* Handshake Authentication Card */}
+          <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-5 shadow-lg">
+            <h2 className="text-sm font-semibold text-white mb-1 flex items-center justify-between">
+              <span>AirPlay Handshake & Auto-Display</span>
+              {handshakeState === 'streaming' && (
+                <span className="text-xs text-emerald-400 flex items-center gap-1 font-mono">
+                  <CheckCircle2 className="w-3.5 h-3.5" /> Streaming to PC Screen
+                </span>
+              )}
+            </h2>
+            <p className="text-xs text-neutral-400 mb-4">
+              When connection completes, the receiver PC automatically switches and displays your screen.
+            </p>
+
+            {handshakeState === 'idle' && (
+              <div className="space-y-4">
+                {autoStartCountdown !== null && (
+                  <div className="p-3 bg-blue-950/40 border border-blue-800/60 rounded-xl text-xs text-blue-300 flex items-center justify-between">
+                    <span>Auto-connecting to receiver in {autoStartCountdown}s...</span>
+                    <button
+                      onClick={() => setAutoStartCountdown(null)}
+                      className="text-neutral-400 hover:text-white underline text-[11px]"
+                    >
+                      Cancel auto-connect
+                    </button>
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-xs font-medium text-neutral-300 mb-1.5">
+                    Apple Device Model
+                  </label>
+                  <select
+                    value={deviceModel}
+                    onChange={(e) => setDeviceModel(e.target.value)}
+                    className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-xs text-neutral-200 focus:outline-hidden focus:border-blue-500"
+                  >
+                    <option value="Apple iPhone 16 Pro (iOS 18.2)">Apple iPhone 16 Pro (iOS 18.2)</option>
+                    <option value="Apple iPad Pro 13-inch M4 (iPadOS 18.2)">Apple iPad Pro 13-inch M4 (iPadOS 18.2)</option>
+                    <option value="Apple MacBook Pro 16-inch M3 Max (macOS Sequoia 15.3)">Apple MacBook Pro 16-inch M3 Max (macOS Sequoia 15.3)</option>
+                    <option value="Apple iPhone 15 (iOS 18.1)">Apple iPhone 15 (iOS 18.1)</option>
+                  </select>
                 </div>
 
-                <div className="pointer-events-auto flex items-center gap-2">
-                  <button
-                    onClick={() => onToggleMiracastBridge(!roomState.windowsDisplayActive)}
-                    className={`px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-lg backdrop-blur-md transition-all ${
-                      roomState.windowsDisplayActive
-                        ? 'bg-blue-600 text-white border border-blue-400'
-                        : 'bg-neutral-900/90 text-neutral-200 border border-neutral-700 hover:bg-neutral-800'
-                    }`}
-                  >
-                    <Radio className="w-3.5 h-3.5" />
-                    {roomState.windowsDisplayActive ? 'Miracast Relaying' : 'Convert to Windows Display'}
-                  </button>
-
-                  <button
-                    onClick={toggleFullscreen}
-                    className="p-2 bg-neutral-950/80 backdrop-blur-md hover:bg-neutral-800 text-neutral-300 rounded-xl border border-neutral-800 transition-colors"
-                    title={isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
-                  >
-                    {isFullscreen ? <Minimize className="w-4 h-4" /> : <Maximize className="w-4 h-4" />}
-                  </button>
+                <div>
+                  <label className="block text-xs font-medium text-neutral-300 mb-1.5 flex items-center justify-between">
+                    <span>AirPlay PIN Code</span>
+                    <span className="text-[11px] text-neutral-500">From PC Screen</span>
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      maxLength={4}
+                      value={pinInput}
+                      onChange={(e) => setPinInput(e.target.value)}
+                      placeholder="4829"
+                      className="w-28 bg-neutral-950 border border-neutral-700 rounded-lg px-3 py-2 text-center text-lg tracking-widest font-mono text-white focus:outline-hidden focus:border-blue-500"
+                    />
+                    <button
+                      onClick={startAirPlayHandshake}
+                      className="flex-1 py-2 px-4 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg transition-colors flex items-center justify-center gap-2 shadow-sm"
+                    >
+                      <Cast className="w-4 h-4" />
+                      Start AirPlay Mirroring
+                    </button>
+                  </div>
                 </div>
               </div>
+            )}
 
-              {/* Bottom Floating Control Bar */}
-              <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between bg-neutral-950/85 backdrop-blur-md px-4 py-2.5 rounded-2xl border border-neutral-800">
-                <div className="flex items-center gap-3">
-                  {/* Volume Control */}
-                  <button
-                    onClick={() => setIsMuted(!isMuted)}
-                    className="text-neutral-400 hover:text-white transition-colors"
-                  >
-                    {isMuted || volume === 0 ? <VolumeX className="w-4 h-4 text-red-400" /> : <Volume2 className="w-4 h-4" />}
-                  </button>
-                  <input
-                    type="range"
-                    min="0"
-                    max="100"
-                    value={isMuted ? 0 : volume}
-                    onChange={(e) => {
-                      setVolume(parseInt(e.target.value, 10));
-                      if (isMuted) setIsMuted(false);
-                    }}
-                    className="w-24 accent-blue-500 h-1.5 bg-neutral-800 rounded-lg cursor-pointer"
-                  />
-                  <span className="text-[11px] font-mono text-neutral-400">
-                    {isMuted ? 'Muted' : `${volume}%`} (ALAC)
-                  </span>
+            {(handshakeState === 'authenticating' || handshakeState === 'streaming') && (
+              <div className="space-y-4">
+                {/* Step Timeline */}
+                <div className="space-y-2.5">
+                  {handshakeSteps.map((step, idx) => {
+                    const isDone = idx < currentStepIndex || handshakeState === 'streaming';
+                    const isCurrent = idx === currentStepIndex && handshakeState === 'authenticating';
+                    return (
+                      <div
+                        key={idx}
+                        className={`flex items-start gap-3 p-2.5 rounded-xl border text-xs transition-colors ${
+                          isDone
+                            ? 'bg-neutral-950/60 border-neutral-800/80 text-neutral-300'
+                            : isCurrent
+                            ? 'bg-blue-950/40 border-blue-500/40 text-blue-200 animate-pulse'
+                            : 'bg-neutral-950/20 border-neutral-800/40 text-neutral-600'
+                        }`}
+                      >
+                        <div className="mt-0.5">
+                          {isDone ? (
+                            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                          ) : (
+                            <div className="w-4 h-4 rounded-full border border-neutral-700 flex items-center justify-center text-[10px] font-mono">
+                              {idx + 1}
+                            </div>
+                          )}
+                        </div>
+                        <div className="flex-1">
+                          <div className="font-medium text-neutral-200">{step.title}</div>
+                          <div className="text-[11px] text-neutral-400">{step.desc}</div>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
 
-                {/* Aspect Ratio Selector */}
-                <div className="flex items-center gap-1 bg-neutral-900 p-0.5 rounded-lg border border-neutral-800 text-xs">
-                  <button
-                    onClick={() => setAspectRatio('portrait')}
-                    className={`px-2 py-1 rounded-md transition-colors ${
-                      aspectRatio === 'portrait' ? 'bg-neutral-800 text-white' : 'text-neutral-400 hover:text-white'
-                    }`}
-                  >
-                    iPhone (19.5:9)
-                  </button>
-                  <button
-                    onClick={() => setAspectRatio('ipad')}
-                    className={`px-2 py-1 rounded-md transition-colors ${
-                      aspectRatio === 'ipad' ? 'bg-neutral-800 text-white' : 'text-neutral-400 hover:text-white'
-                    }`}
-                  >
-                    iPad (4:3)
-                  </button>
-                  <button
-                    onClick={() => setAspectRatio('landscape')}
-                    className={`px-2 py-1 rounded-md transition-colors ${
-                      aspectRatio === 'landscape' ? 'bg-neutral-800 text-white' : 'text-neutral-400 hover:text-white'
-                    }`}
-                  >
-                    16:9 Wide
-                  </button>
-                </div>
+                {handshakeState === 'streaming' && (
+                  <div className="pt-2 flex items-center justify-between border-t border-neutral-800">
+                    <span className="text-xs text-emerald-400 flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                      Receiving screen is now live on PC
+                    </span>
+                    <button
+                      onClick={handleDisconnect}
+                      className="py-1.5 px-3 bg-red-600/20 hover:bg-red-600/30 text-red-400 border border-red-800/40 rounded-lg text-xs font-medium transition-colors"
+                    >
+                      Stop Mirroring
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {errorMessage && (
+              <div className="mt-3 p-3 bg-red-950/40 border border-red-800/60 rounded-xl text-xs text-red-300 flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0 text-red-400" />
+                <span>{errorMessage}</span>
+              </div>
+            )}
+          </div>
+
+          {/* Quick Info */}
+          <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-5">
+            <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">
+              Apple Device Protocol Handshake
+            </h3>
+            <div className="grid grid-cols-2 gap-3 text-xs">
+              <div className="p-2.5 bg-neutral-950 rounded-xl border border-neutral-800">
+                <span className="text-neutral-500 block text-[11px]">Video Codec</span>
+                <span className="font-mono text-neutral-200">H.264 High @ 60fps</span>
+              </div>
+              <div className="p-2.5 bg-neutral-950 rounded-xl border border-neutral-800">
+                <span className="text-neutral-500 block text-[11px]">Audio Codec</span>
+                <span className="font-mono text-neutral-200">ALAC 44.1kHz Stereo</span>
+              </div>
+              <div className="p-2.5 bg-neutral-950 rounded-xl border border-neutral-800">
+                <span className="text-neutral-500 block text-[11px]">Pairing Security</span>
+                <span className="font-mono text-neutral-200">SRP-6a + Curve25519</span>
+              </div>
+              <div className="p-2.5 bg-neutral-950 rounded-xl border border-neutral-800">
+                <span className="text-neutral-500 block text-[11px]">Windows Target</span>
+                <span className="font-mono text-neutral-200">Miracast / WFD 1.1</span>
               </div>
             </div>
           </div>
-        )}
-
-        {/* Windows Wireless Display (Miracast / WFD) Converter Console */}
-        <WindowsWirelessBridge
-          isActive={roomState.windowsDisplayActive}
-          onToggleActive={onToggleMiracastBridge}
-          airplayResolution={roomState.resolution}
-          airplayFps={roomState.fps}
-        />
-      </main>
-
-      {/* Protocol Inspector Modal */}
-      <ProtocolInspector
-        isOpen={isInspectorOpen}
-        onClose={() => setIsInspectorOpen(false)}
-        logs={protocolLogs}
-        onClearLogs={onClearLogs}
-      />
+        </div>
+      </div>
     </div>
   );
 };
