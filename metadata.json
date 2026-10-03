@@ -1,0 +1,13 @@
+{
+  "name": "AirPlay Web Receiver & Windows Wireless Display Bridge",
+  "description": "High-fidelity AirPlay receiver for Apple devices with QR code handshake, full protocol emulation (mDNS/Bonjour, SRP/FairPlay, RTSP, RTP/ALAC), and conversion to Windows Wireless Display (Miracast/WFD).",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "display-capture"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
+
